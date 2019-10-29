@@ -1,122 +1,164 @@
-import math
-import numpy as np
+import cozmo
+import asyncio
+import sys
+import random
+from cozmo.util import distance_mm
 
 
-class EmotionVector:
+class Agent:
 
-    def __init__(self, **kwargs):
-        if "strength" in kwargs and "angle" in kwargs:
-            # strength -> [0, 1]
-            self.strength = None
-            # angle -> [0, 360]
-            self.angle = None
-            self.set_strength_angle(kwargs["strength"], kwargs["angle"])
-        elif "x" in kwargs and "y" in kwargs:
-            self.x = None
-            self.y = None
-            self.set_xy(kwargs["x"], kwargs["y"])
+    def __init__(self, robot):
+        self.robot = robot
+        self.world = robot.world
+        self.behavior = None
+        self.action = None
+        self.cubes = None
+        self.cubes_dist = None
+        self.min_dist_cube_id = None
+        self.animation = None
 
-    def set_strength_angle(self, strength, angle):
-        self.strength = strength
-        self.angle = angle
-        self.x = strength * math.cos(math.radians(angle))
-        self.y = strength * math.sin(math.radians(angle))
+    def calculate_dist(self, cube):
+        translation = self.robot.pose - cube.pose
+        return ((translation.position.x / 100) ** 2) + ((translation.position.y / 100) ** 2)
 
-    def set_xy(self, x, y):
-        self.x = x
-        self.y = y
-        self.strength = math.sqrt(math.pow(x, 2)+math.pow(y, 2))
-        angle_aux = math.degrees(math.asin(y/self.strength))
-        if angle_aux >= 0:
-            if x >= 0:
-                self.angle = 0 + angle_aux
-            else:
-                self.angle = 180 - angle_aux
+    def get_cubes_dists(self, cubes):
+        self.cubes_dist = {cube.cube_id: self.calculate_dist(cube) for cube in cubes}
+
+    def get_n_min_dist_cube_id(self, n=1):
+        if not self.cubes_dist:
+            raise Exception("no cubes recognized now")
+        self.min_dist_cube_id = list(filter(
+            lambda cube_id: self.cubes_dist[cube_id] == sorted(self.cubes_dist.values())[n-1], self.cubes_dist))[0]
+
+    def set_behavior(self, behavior):
+        if self.behavior is not None:
+            raise Exception("already assigned behaviors, stop first")
+        self.behavior = self.robot.start_behavior(behavior)
+
+    def stop_behavior(self):
+        if not self.behavior:
+            raise Exception("No behavior assigned")
+        self.behavior.stop()
+        self.behavior = None
+
+    def celebrity(self):
+        self.animation = self.robot.play_anim_trigger(cozmo.anim.Triggers.OnSpeedtapGameCozmoWinHighIntensity)
+
+    async def recognize_cubes(self):
+        self.cubes = await self.world.wait_until_observe_num_objects(num=3, object_type=cozmo.objects.LightCube, timeout=60)
+
+
+class MultiAgents:
+
+    def __init__(self, *args):
+        self.agent_x, self.agent_y = Agent(args[0]), Agent(args[1])
+        self.agents_id = {1: self.agent_x, 2: self.agent_y}
+        self.targs = {1: {"pick_targ": None, "place_targ": None}, 2: {"pick_targ": None, "place_targ": None}}
+        self.flag = True
+
+    def who_last(self):
+        return random.choice(list(self.agents_id))
+
+    async def recognize_cubes_together(self):
+
+        self.agent_x.set_behavior(cozmo.behavior.BehaviorTypes.LookAroundInPlace)
+        self.agent_y.set_behavior(cozmo.behavior.BehaviorTypes.LookAroundInPlace)
+
+        try:
+            await self.agent_x.recognize_cubes()
+        except asyncio.TimeoutError:
+            print("don't find cube")
         else:
-            if x >= 0:
-                self.angle = 360 + angle_aux
-            else:
-                self.angle = 180 - angle_aux
+            self.agent_x.stop_behavior()
 
-    def __repr__(self):
-        return "({:.2f}, {:.2f}), \n angle: {:.2f}, strength: {:.2f}".format(self.x, self.y, self.angle, self.strength)
+        try:
+            await self.agent_y.recognize_cubes()
+        except asyncio.TimeoutError:
+            print("don't find cube")
+        else:
+            self.agent_y.stop_behavior()
 
-    def __add__(self, other):
-        new = EmotionVector()
-        new.set_xy(self.x + other.x, self.y + other.y)
-        return new
+        self.agent_x.get_cubes_dists(self.agent_x.cubes)
+        self.agent_y.get_cubes_dists(self.agent_y.cubes)
 
-    def __sub__(self, other):
-        new = EmotionVector()
-        new.set_xy(self.x - other.x, self.y - other.y)
-        return new
+        self.agent_x.get_n_min_dist_cube_id()
+        self.agent_y.get_n_min_dist_cube_id()
 
+        if self.agent_x.min_dist_cube_id == self.agent_y.min_dist_cube_id:
+            self.agents_id[self.who_last()].get_n_min_dist_cube_id(n=2)
 
-class EmotionSpace:
+    def cooperate_assign_cubes(self):
 
-    mapper = {1: {0: "surprised", 1: "excited", 2: "pleasant", 3: "happy"},
-              2: {0: "surprised", 1: "angry", 2: "fear", 3: "annoyed"},
-              3: {0: "calm", 1: "tired", 2: "desperate", 3: "sad"},
-              4: {0: "calm", 1: "relaxed", 2: "peaceful", 3: "satisfied"}}
-    emotions = ["surprised", "excited", "pleasant", "happy",
-                "angry", "fear", "annoyed", "clam", "tired",
-                "desperate", "sad", "relaxed", "peaceful", "satisfied"]
+        place_targ_exclu_ids = [self.agent_x.min_dist_cube_id, self.agent_y.min_dist_cube_id]
 
+        for cube_x in self.agent_x.cubes:
+            if cube_x.cube_id == self.agent_x.min_dist_cube_id:
+                self.targs[1]["pick_targ"] = cube_x
+            if cube_x.cube_id not in place_targ_exclu_ids:
+                self.targs[1]["place_targ"] = cube_x
 
-class Emotion(EmotionVector):
+        for cube_y in self.agent_y.cubes:
+            if cube_y.cube_id == self.agent_y.min_dist_cube_id:
+                self.targs[2]["pick_targ"] = cube_y
+            if cube_y.cube_id not in place_targ_exclu_ids:
+                self.targs[2]["place_targ"] = cube_y
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.mapper = EmotionSpace.mapper
-        self.area = None
+    async def agent_plays_cube(self, aid):
+        agent = self.agents_id[aid]
 
-    def get_emotion(self):
-        return self.get_area_emo()
+        while not agent.robot.is_carrying_block:
+            await agent.robot.pickup_object(self.targs[aid]["pick_targ"], num_retries=1).wait_for_completed()
 
-    def set_area(self):
-        self.area = list(filter(lambda area: (self.angle/360*4) <= area, range(1, 5)))[0]
-
-    def get_area_emo(self, threshold=math.pow(2, 0.5)/2):
-        self.set_area()
-        x_aux = int(math.fabs(self.x) <= threshold)
-        y_aux = int(math.fabs(self.y) <= threshold)
-        if math.fabs(self.y) > 0.9:
-            x_aux -= 1
-        if y_aux:
-            y_aux += 1
-        return self.mapper[self.area][x_aux + y_aux]
-
-    def change_emotion(self, target, nt, t):
-        assert isinstance(target, EmotionVector) or isinstance(target, Emotion)
-        delta = target - self
-        curr_x, curr_y = np.array([self.x, self.y]) + np.array([delta.x, delta.y]) * t / nt
-        curr = Emotion()
-        curr.set_xy(curr_x, curr_y)
-        return curr
-
-    def __repr__(self):
-        return "emotion: {}, ({:.2f}, {:.2f}), \n angle: {:.2f}, strength: {:.2f}".format(
-            self.get_emotion(), self.x, self.y, self.angle, self.strength)
+        if self.flag:
+            await agent.robot.place_on_object(self.targs[aid]["place_targ"], num_retries=3).wait_for_completed()
+            self.flag = False
+        else:
+            await agent.robot.go_to_object(self.targs[aid]["place_targ"],
+                                                 distance_from_object=distance_mm(100)).wait_for_completed()
+            await agent.robot.place_object_on_ground_here(self.targs[aid]["place_targ"]).wait_for_completed()
 
 
-coordinates =[{"x": math.sqrt(2)/4, "y": math.sqrt(2)/4},
-{"x": math.sqrt(2)/4, "y": -math.sqrt(2)/4},
-{"x": -math.sqrt(2)/4, "y": math.sqrt(2)/4},
-{"x": -math.sqrt(2)/4, "y": -math.sqrt(2)/4},
-{"x": math.sqrt(2)/4, "y": (0.9+math.sqrt(2))/2},
-{"x": math.sqrt(2)/4, "y": -(0.9+math.sqrt(2))/2},
-{"x": -math.sqrt(2)/4, "y": (0.9+math.sqrt(2))/2},
-{"x": -math.sqrt(2)/4, "y": -(0.9+math.sqrt(2))/2},
-{"x": (0.9+math.sqrt(2))/2, "y": math.sqrt(2)/4},
-{"x": (0.9+math.sqrt(2))/2, "y": -math.sqrt(2)/4},
-{"x": -(0.9+math.sqrt(2))/2, "y": math.sqrt(2)/4},
-{"x": -(0.9+math.sqrt(2))/2, "y": -math.sqrt(2)/4},
-{"x": 0, "y": 0.95},
-{"x": 0, "y": -0.95}
-]
+def main(sdk_1, sdk_2, loop):
+
+    async def init(sdk1, sdk2):
+
+        robot_x = await sdk1.wait_for_robot()
+        robot_y = await sdk2.wait_for_robot()
+
+        multi_agents = MultiAgents(robot_x, robot_y)
+        return multi_agents
+
+    agents = loop.run_until_complete(init(sdk_1, sdk_2))
+    loop.run_until_complete(agents.recognize_cubes_together())
+    agents.cooperate_assign_cubes()
+
+    loop.run_until_complete(asyncio.gather(agents.agent_plays_cube(1), agents.agent_plays_cube(2)))
+    # action_1 = asyncio.ensure_future(agents.agent_plays_cube(1), loop=loop)
+    # action_2 = asyncio.ensure_future(agents.agent_plays_cube(2), loop=loop)
+
+    # return action_1, action_2
 
 
-v = []
-for each in coordinates:
-    ev = Emotion(**each)
-    v.append(ev)
+if __name__ == '__main__':
+
+    cozmo.setup_basic_logging()
+    # cozmo.setup_basic_logging()
+    al_loop = asyncio.get_event_loop()
+    cozmo.robot.Robot.drive_off_charger_on_connect = False
+    # Connect to both robots
+    # NOTE: to connect to a specific device with a specific serial number,
+    # create a connector (eg. `cozmo.IOSConnector(serial='abc')) and pass it
+    # explicitly to `connect` or `connect_on_loop`
+    try:
+        conn1 = cozmo.connect_on_loop(al_loop)
+        conn2 = cozmo.connect_on_loop(al_loop)
+    except cozmo.ConnectionError as e:
+        sys.exit("A connection error occurred: %s" % e)
+
+    main(conn1, conn2, al_loop)
+    # task = asyncio.ensure_future(main(conn1, conn2), loop=al_loop)
+    # Run a coroutine controlling both connections
+    # al_loop.run_until_complete(task)
+
+    # print("doing")
+    # al_loop.run_until_complete(asyncio.gather(a1, a2))
